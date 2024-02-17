@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "animetodayscraper"
+version = "0.1.0"
+description = ""
+authors = ["Nate Shoffner <nate.shoffner@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+aiohttp = "^3.9.3"
+asyncpraw = "^7.7.1"
+python-dotenv = "^1.0.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
