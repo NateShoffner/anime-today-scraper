@@ -6,7 +6,6 @@ from typing import Optional
 import aiohttp
 import os
 import asyncpraw
-import calendar
 from attr import dataclass
 from dotenv import load_dotenv
 
