@@ -2,6 +2,7 @@ from peewee import *
 
 from db import BaseModel
 
+
 class MediaPost(BaseModel):
     id = TextField(primary_key=True)
     username = TextField()
@@ -16,4 +17,3 @@ class MediaPost(BaseModel):
 
     class Meta:
         table_name = "media_posts"
-        

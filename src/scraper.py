@@ -5,13 +5,15 @@ import aiohttp
 import os
 import asyncpraw
 from dotenv import load_dotenv
-
+from PIL import Image
 from models import MediaPost
 
 load_dotenv()
 
+
 def get_permalink(submission: asyncpraw.models.Submission) -> str:
     return f"https://www.reddit.com{submission.permalink}"
+
 
 class Scraper:
     def __init__(
@@ -26,18 +28,48 @@ class Scraper:
         await self.download_to_organized_directories()
 
     async def download_media(self):
-        """ Download all media posts from the target user """
+        """Download all media posts from the target user"""
         for post in MediaPost.select().where(MediaPost.username == self.username):
             await self.download_image(post, self.data_dir)
 
+    def convert_to_png(self, filename: str):
+        # check if the file is already a png
+        if filename.endswith(".png"):
+            return
+
+        # convert the image to a png
+        new_filename = filename.replace(".jpg", ".png")
+
+        converted = False
+        try:
+            with Image.open(filename) as img:
+                img.save(new_filename, "PNG")
+
+            converted = True
+        except Exception as e:
+            print(f"Error converting {filename} to PNG: {e}")
+            return
+
+        if converted:
+            try:
+                os.remove(filename)
+            except Exception as e:
+                print(f"Error removing {filename}: {e}")
+
     async def get_posts(self):
-        """ Get all posts from the target user """
-        most_recent_post = MediaPost.select().where(
-            MediaPost.username == self.username
-        ).order_by(MediaPost.created_utc.desc()).first()
-        oldest_post = MediaPost.select().where(
-            MediaPost.username == self.username
-        ).order_by(MediaPost.created_utc.asc()).first()
+        """Get all posts from the target user"""
+        most_recent_post = (
+            MediaPost.select()
+            .where(MediaPost.username == self.username)
+            .order_by(MediaPost.created_utc.desc())
+            .first()
+        )
+        oldest_post = (
+            MediaPost.select()
+            .where(MediaPost.username == self.username)
+            .order_by(MediaPost.created_utc.asc())
+            .first()
+        )
 
         print(f"Most recent post: {most_recent_post}")
         print(f"Oldest post: {oldest_post}")
@@ -47,7 +79,6 @@ class Scraper:
             client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
             user_agent=self.user_agent,
         ) as reddit:
-
             target_user = await reddit.redditor(self.username)
 
             month_names = [name.lower() for name in month_name if name]
@@ -59,7 +90,10 @@ class Scraper:
                 already_processed = False
 
                 if most_recent_post and oldest_post:
-                    already_processed = submission.created_utc <= most_recent_post.created_utc and submission.created_utc >= oldest_post.created_utc
+                    already_processed = (
+                        submission.created_utc <= most_recent_post.created_utc
+                        and submission.created_utc >= oldest_post.created_utc
+                    )
 
                 if already_processed:
                     print(f"Post already processed: {submission.title}")
@@ -76,7 +110,7 @@ class Scraper:
                     and not any(day in title for day in day_names)
                     and "today" not in title
                 ):
-                    malformed_title = True                    
+                    malformed_title = True
 
                 if not submission.url.endswith(("jpg", "jpeg", "png", "gif")):
                     print(f"Skipping {submission.title} because it's not an image")
@@ -110,9 +144,8 @@ class Scraper:
                     media_url=submission.url,
                     created_utc=submission.created_utc,
                     first_comment=submission_comment,
-
                     malformed_title=malformed_title,
-                    non_media_post=non_media_post
+                    non_media_post=non_media_post,
                 )
 
     async def download_to_organized_directories(self):
@@ -132,20 +165,21 @@ class Scraper:
             day_dir = os.path.join(submission_month_dir, submission_day)
             if not os.path.exists(day_dir):
                 os.makedirs(day_dir)
-            
+
             extension = submission.media_url.split(".")[-1]
             image_filename = os.path.join(day_dir, submission.id)
             image_filename = f"{image_filename}.{extension}"
             await self.download_image(submission, image_filename)
+            self.convert_to_png(image_filename)
 
             # save the comment to a file
             if submission.first_comment:
                 comment_filename = os.path.join(day_dir, f"{submission.id}.txt")
                 with open(comment_filename, "w", encoding="utf-8") as f:
                     f.write(submission.first_comment)
-    
+
     async def download_image(self, submission: MediaPost, filename: str):
-        """ Download the image to the given directory """
+        """Download the image to the given directory"""
         if os.path.exists(filename):
             return
 

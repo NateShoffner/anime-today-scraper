@@ -23,7 +23,6 @@ scraper = Scraper("animetoday", data_dir)
 
 
 async def main():
-    #DailyAnimePost.drop_table()
     database.create_tables([MediaPost])
     await scraper.run()
 
