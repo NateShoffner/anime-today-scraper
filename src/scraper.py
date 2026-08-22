@@ -1,6 +1,7 @@
 import asyncio
 from calendar import month_name, day_name
 import datetime
+import json
 import aiohttp
 import os
 import asyncpraw
@@ -25,20 +26,22 @@ class Scraper:
 
     async def run(self):
         await self.get_posts()
-        await self.download_to_organized_directories()
+        await self.download_to_single_directory()
 
     async def download_media(self):
         """Download all media posts from the target user"""
         for post in MediaPost.select().where(MediaPost.username == self.username):
             await self.download_image(post, self.data_dir)
 
+    def get_png_filename(self, filename: str) -> str:
+        return filename.replace(".jpg", ".png")
+
     def convert_to_png(self, filename: str):
         # check if the file is already a png
         if filename.endswith(".png"):
             return
 
-        # convert the image to a png
-        new_filename = filename.replace(".jpg", ".png")
+        new_filename = self.get_png_filename(filename)
 
         converted = False
         try:
@@ -147,6 +150,49 @@ class Scraper:
                     malformed_title=malformed_title,
                     non_media_post=non_media_post,
                 )
+
+    async def download_to_single_directory(self):
+        posts = MediaPost.select().where(MediaPost.username == self.username).order_by(
+            MediaPost.created_utc.desc()
+        )
+
+        bulk_dir = os.path.join(self.data_dir, "bulk")
+        if not os.path.exists(bulk_dir):
+            os.makedirs(bulk_dir)
+
+        posts_data = {}
+
+        for submission in posts:
+            print(f"Processing {submission.title} - {submission.permalink}")
+
+            comment = ""
+            if submission.first_comment:
+                # remove '{' at the beginning and '}' at the end
+                comment = submission.first_comment[1:-1]
+
+            submission_date = datetime.datetime.utcfromtimestamp(submission.created_utc)
+            submission_month = submission_date.strftime("%m")
+            submission_day = submission_date.strftime("%d")
+            extension = submission.media_url.split(".")[-1]
+            image_filename = os.path.join(
+                bulk_dir, f"{submission_month}_{submission_day}.{extension}"
+            )
+
+            png_filename = self.get_png_filename(image_filename)
+
+            posts_data[f"{submission_month}_{submission_day}"] = {
+                "comment": comment,
+            }
+
+            if os.path.exists(png_filename):
+                print(f"Skipping {submission.title} because it's already downloaded")
+                continue
+
+            await self.download_image(submission, image_filename)
+            self.convert_to_png(image_filename)
+
+        with open(os.path.join(bulk_dir, "data.json"), "w") as f:
+            f.write(json.dumps(posts_data, indent=4))
 
     async def download_to_organized_directories(self):
         posts = MediaPost.select().where(MediaPost.username == self.username)
