@@ -34,7 +34,8 @@ class Scraper:
             await self.download_image(post, self.data_dir)
 
     def get_png_filename(self, filename: str) -> str:
-        return filename.replace(".jpg", ".png")
+        root, _ = os.path.splitext(filename)
+        return f"{root}.png"
 
     def convert_to_png(self, filename: str):
         # check if the file is already a png
@@ -180,7 +181,15 @@ class Scraper:
 
             png_filename = self.get_png_filename(image_filename)
 
-            posts_data[f"{submission_month}_{submission_day}"] = {
+            date_key = f"{submission_month}_{submission_day}"
+
+            # posts are ordered newest first, so the first one seen for a given
+            # date wins and older posts for that same date are discarded
+            if date_key in posts_data:
+                print(f"Skipping {submission.title} because {date_key} is already taken")
+                continue
+
+            posts_data[date_key] = {
                 "comment": comment,
             }
 
