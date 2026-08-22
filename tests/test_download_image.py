@@ -63,7 +63,7 @@ def test_sends_a_user_agent(tmp_path, fake_http, post):
     scraper = Scraper("animetoday", str(tmp_path), user_agent="script:post-scraper")
     target = tmp_path / "01_01.jpg"
 
-    assert asyncio.run(scraper.download_image(post, str(target))) is True
+    assert asyncio.run(scraper.download_image(post, str(target))) == str(target)
 
     # imgur answers the default aiohttp user agent with an empty 429
     assert record["headers"] == {"User-Agent": "script:post-scraper"}
@@ -77,7 +77,7 @@ def test_no_file_is_written_for_a_failed_response(tmp_path, fake_http, post, sta
     scraper = Scraper("animetoday", str(tmp_path))
     target = tmp_path / "01_01.jpg"
 
-    assert asyncio.run(scraper.download_image(post, str(target))) is False
+    assert asyncio.run(scraper.download_image(post, str(target))) is None
     assert not target.exists()
 
 
@@ -86,8 +86,28 @@ def test_no_file_is_written_for_an_empty_body(tmp_path, fake_http, post):
     scraper = Scraper("animetoday", str(tmp_path))
     target = tmp_path / "01_01.jpg"
 
-    assert asyncio.run(scraper.download_image(post, str(target))) is False
+    assert asyncio.run(scraper.download_image(post, str(target))) is None
     assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        (b"\xff\xd8\xff\xe0 jpeg", "01_01.jpg"),
+        (b"\x89PNG\r\n\x1a\n png", "01_01.png"),
+        (b"GIF89a gif", "01_01.gif"),
+        (b"who knows", "01_01.jpg"),
+    ],
+)
+def test_the_extension_comes_from_the_bytes(tmp_path, fake_http, post, body, expected):
+    """Imgur serves png content from .jpg links, so the url cannot be trusted."""
+    fake_http(status=200, body=body)
+    scraper = Scraper("animetoday", str(tmp_path))
+
+    written = asyncio.run(scraper.download_image(post, str(tmp_path / "01_01.jpg")))
+
+    assert written == str(tmp_path / expected)
+    assert (tmp_path / expected).read_bytes() == body
 
 
 def test_an_existing_file_is_not_downloaded_again(tmp_path, fake_http, post):
@@ -96,6 +116,6 @@ def test_an_existing_file_is_not_downloaded_again(tmp_path, fake_http, post):
     target = tmp_path / "01_01.jpg"
     target.write_bytes(b"already here")
 
-    assert asyncio.run(scraper.download_image(post, str(target))) is True
+    assert asyncio.run(scraper.download_image(post, str(target))) == str(target)
     assert record == {}
     assert target.read_bytes() == b"already here"
