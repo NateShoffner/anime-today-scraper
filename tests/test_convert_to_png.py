@@ -49,14 +49,29 @@ def test_convert_to_png_leaves_an_existing_png_alone(scraper, tmp_path):
     assert source.read_bytes() == before
 
 
-def test_convert_to_png_keeps_the_source_when_conversion_fails(scraper, tmp_path):
+def test_convert_to_png_removes_an_unconvertible_source(scraper, tmp_path):
+    """A leftover source file would make download_image skip the post forever.
+
+    download_image returns early when the file already exists, while the caller
+    only checks for the png, so a corrupt source that never converts poisons
+    every future run.
+    """
     source = tmp_path / "01_01.jpg"
     source.write_text("not an image")
 
     scraper.convert_to_png(str(source))
 
-    assert source.exists()
+    assert not source.exists()
     assert not (tmp_path / "01_01.png").exists()
+
+
+def test_convert_to_png_removes_a_zero_byte_source(scraper, tmp_path):
+    source = tmp_path / "01_01.jpg"
+    source.touch()
+
+    scraper.convert_to_png(str(source))
+
+    assert not source.exists()
 
 
 def test_get_permalink_prefixes_the_reddit_host():

@@ -30,6 +30,7 @@ def downloads(monkeypatch):
     async def fake_download_image(self, submission, filename):
         calls.append(filename)
         Image.new("RGB", (4, 4), colours.get(submission.id, (0, 0, 0))).save(filename)
+        return True
 
     monkeypatch.setattr(Scraper, "download_image", fake_download_image)
     calls.colours = colours
@@ -100,6 +101,31 @@ def test_existing_image_is_not_downloaded_again(
     assert downloads == []
     # the entry still has to be written, since data.json is rebuilt from scratch
     assert read_data_json(tmp_path) == {"01_01": {"comment": "Cowboy Bebop"}}
+
+
+def test_non_media_posts_are_skipped(scraper, tmp_path, downloads, make_post):
+    """gifv, gfycat links and typo'd extensions are not downloadable images."""
+    make_post("aaa", month=1, day=1, extension="jpg", comment="{Cowboy Bebop}")
+    junk = make_post("bbb", month=2, day=2, extension="gifv", comment="{Nope}")
+    junk.non_media_post = True
+    junk.save()
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    assert read_data_json(tmp_path) == {"01_01": {"comment": "Cowboy Bebop"}}
+    assert len(downloads) == 1
+
+
+def test_stray_whitespace_is_stripped_from_the_caption(
+    scraper, tmp_path, downloads, make_post
+):
+    make_post("aaa", month=1, day=1, comment="{\t\nYama no Susume: Second Season}")
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    assert read_data_json(tmp_path) == {
+        "01_01": {"comment": "Yama no Susume: Second Season"}
+    }
 
 
 def test_other_users_posts_are_ignored(scraper, tmp_path, downloads, make_post):
