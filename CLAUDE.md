@@ -86,13 +86,20 @@ Every submission is stored, with two boolean flags:
 
 - `malformed_title` when the title contains no month name, no weekday name, and not
   the word "today".
-- `non_media_post` when the URL does not end in jpg/jpeg/png/gif.
+- `non_media_post` when the url's path carries no file extension at all. That is a
+  deliberately loose test: the downloaded bytes decide what a response really is, so a
+  mislabelled url costs nothing, while bare links like `gfycat.com/SomeSlug` are
+  rejected before any request. Tightening this to a fixed extension list is what
+  previously threw away imgur's typo'd `.jpgg` links, which serve ordinary jpegs.
 
 The comment lookup costs one extra API call per post and sleeps 1s to stay under rate
-limits, so it only runs for posts that pass both checks. The render phase filters out
-`non_media_post` rows, which is what keeps gifv, gfycat and typo'd `.jpgg` links from
-being downloaded and then failing to convert. It does not filter on `malformed_title`,
-since those posts still carry a usable image.
+limits, so it only runs for posts that pass both checks. That is why widening
+`non_media_post` leaves the newly included posts with no caption until
+`backfill_comments` runs.
+
+The render phase filters out `non_media_post` rows and nothing else. It does not filter
+on `malformed_title`, since a typo'd title like "Junly 1st" still carries a real image
+and a real caption.
 
 ### Output layout
 
@@ -101,13 +108,17 @@ since those posts still carry a usable image.
 - `MM_DD.<ext>` per image, stored in whatever format the post used. Nothing is
   re-encoded: the sources are already lossy jpeg, so converting to png cost roughly
   310ms per image and 2.6x the disk for no quality gain.
-- `data.json` mapping `"MM_DD"` to `{"comment": ..., "file": ...}`, with the surrounding
-  braces stripped off the stored comment. `file` carries the basename because the
-  extension now varies, and is `null` when the download failed.
+- `MM_DD.mp4` alongside it for the handful of posts that were `.gifv`.
+- `data.json` mapping `"MM_DD"` to `{"comment": ..., "file": ..., "video": ...}`, with
+  the surrounding braces stripped off the stored comment. `file` and `video` carry
+  basenames because the extension varies, and are `null` when absent.
 
-The extension comes from `sniff_extension`, which reads the magic bytes rather than
-trusting the url. Imgur serves png content from `.jpg` links, and at least one post in
-this account's history does exactly that.
+The extension comes from `sniff_extension`, which reads magic bytes and returns None
+for anything else, so a response that is not media is refused rather than written. Urls
+lie in both directions here: imgur serves png content from `.jpg` links, and a `.gifv`
+link returns an html player page. `get_download_urls` rewrites a `.gifv` into its `.gif`
+and `.mp4` siblings, which are both real; the mp4 runs about a seventeenth of the gif's
+size.
 
 Keys are month and day only, so posts from the same calendar date in different years
 collide. Posts are iterated newest-first and the first post seen for a date claims it,
@@ -120,6 +131,16 @@ newest post paired with the caption from the oldest.
 (`data/MM_Month/DD/<post_id>.png` plus a sibling `.txt` caption). It still works but
 is no longer called by `run()`. The `data/` tree checked out locally is in this older
 format.
+
+## Maintenance
+
+`backfill_comments` fetches captions for stored posts that have none, and is
+deliberately not wired into `run()`: a post whose caption is genuinely absent stays
+null, so running it every time would re-request those forever. It exists for the case
+where a post was stored under a classification that skipped the comment lookup and
+later turned out to be media. Widening the `non_media_post` rule is exactly that case,
+and needs the stored flag recomputed for existing rows, since id tracking means those
+posts are never scraped again.
 
 ## Known landmines
 

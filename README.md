@@ -51,16 +51,20 @@ Output
         ...
         data.json
 
-Images are named by month and day and kept in whatever format the post used, so the
-extension varies. `data.json` holds the caption and the filename for each date:
+Images are named by month and day and kept in whatever format the post used (jpg, png,
+gif or webp), so the extension varies. A few posts are imgur `.gifv` links, which are
+saved as both a gif and an mp4. `data.json` holds the caption and the filenames for
+each date:
 
     {
         "01_01": {
             "comment": "Anime Source Title",
-            "file": "01_01.jpg"
+            "file": "01_01.jpg",
+            "video": null
         }
     }
 
-`file` is null if the image could not be downloaded.
+`file` is null if the image could not be downloaded, and `video` is set only for the
+`.gifv` posts.
 
 Nothing under `data/` is committed.
