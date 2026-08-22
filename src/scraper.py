@@ -347,13 +347,13 @@ class Scraper:
         return "video" if extension in VIDEO_EXTENSIONS else "file"
 
     async def download_posts(self, posts, bulk_dir, posts_data, session, existing):
-        """Fill posts_data and the bulk directory, newest post per date wins.
+        """Fill posts_data and the bulk directory.
 
-        Claiming a date is sequential, because the first post seen for a date
-        wins and that ordering has to be respected. The downloads it produces
-        are independent, so they run together.
+        Planning is sequential, because which post claims a date depends on
+        iteration order. The downloads it produces are independent, so they run
+        together.
         """
-        work = self.plan_downloads(posts, posts_data, existing)
+        work, entries = self.plan_downloads(posts, posts_data, existing)
         if not work:
             logger.info("Nothing to download")
             return
@@ -361,31 +361,43 @@ class Scraper:
         logger.info("Downloading %d files", len(work))
         semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
-        async def fetch(date_key, url):
+        async def fetch(base, url):
             async with semaphore:
-                requested = f"{date_key}{os.path.splitext(urlparse(url).path)[1]}"
+                requested = f"{base}{os.path.splitext(urlparse(url).path)[1]}"
                 try:
-                    return date_key, await self.download_image(
+                    return base, await self.download_image(
                         url, os.path.join(bulk_dir, requested), session
                     )
                 except Exception as e:
                     # one bad url must not take the other downloads down with it
                     logger.warning("Error downloading %s: %s", url, e)
-                    return date_key, None
+                    return base, None
 
-        results = await asyncio.gather(*(fetch(d, u) for d, u in work))
+        results = await asyncio.gather(*(fetch(b, u) for b, u in work))
 
-        for date_key, downloaded in results:
+        for base, downloaded in results:
             if not downloaded:
                 continue
             name = os.path.basename(downloaded)
             existing.add(name)
             slot = "video" if name.rpartition(".")[2] in VIDEO_EXTENSIONS else "file"
-            posts_data[date_key][slot] = name
+            entries[base][slot] = name
 
-    def plan_downloads(self, posts, posts_data, existing) -> list:
-        """The (date, url) pairs still missing, filling posts_data as it goes."""
+    def plan_downloads(self, posts, posts_data, existing):
+        """Work still to fetch, plus the entry each filename belongs to.
+
+        Posts arrive newest first. The first post for a date is that date's main
+        entry and keeps the plain MM_DD name, so nothing already downloaded has
+        to move. Older posts for the same date are kept alongside it under
+        "others" rather than discarded, since across years the same calendar date
+        is often a different screenshot of a different show.
+
+        A repost of the identical url is not a second result and is dropped.
+        """
         work = []
+        entries = {}
+        seen_urls = {}
+        used_bases = {}
 
         for submission in posts:
             comment = ""
@@ -393,27 +405,58 @@ class Scraper:
                 # remove '{' at the beginning and '}' at the end
                 comment = submission.first_comment[1:-1].strip()
 
-            submission_date = datetime.datetime.utcfromtimestamp(submission.created_utc)
-            date_key = f"{submission_date:%m_%d}"
+            posted = datetime.datetime.utcfromtimestamp(submission.created_utc)
+            date_key = f"{posted:%m_%d}"
 
-            # posts are ordered newest first, so the first one seen for a given
-            # date wins and older posts for that same date are discarded
-            if date_key in posts_data:
-                logger.debug("Skipping %s, %s is taken", submission.title, date_key)
+            urls = seen_urls.setdefault(date_key, set())
+            if submission.media_url in urls:
+                logger.debug(
+                    "Skipping %s, the same image already fills %s",
+                    submission.title,
+                    date_key,
+                )
                 continue
+            urls.add(submission.media_url)
 
-            # a previous run may have stored this date under another extension
-            posts_data[date_key] = {
+            base = self.get_base_name(date_key, posted.year, submission.id, used_bases)
+
+            entry = {
                 "comment": comment,
-                "file": self.find_existing_image(existing, date_key),
-                "video": f"{date_key}.mp4" if f"{date_key}.mp4" in existing else None,
+                "year": posted.year,
+                # a previous run may have stored this under another extension
+                "file": self.find_existing_image(existing, base),
+                "video": f"{base}.mp4" if f"{base}.mp4" in existing else None,
             }
+            entries[base] = entry
+
+            if date_key in posts_data:
+                posts_data[date_key]["others"].append(entry)
+            else:
+                posts_data[date_key] = dict(entry, others=[])
+                entries[base] = posts_data[date_key]
 
             for url in self.get_download_urls(submission.media_url):
-                if not posts_data[date_key][self.get_slot(url)]:
-                    work.append((date_key, url))
+                if not entries[base][self.get_slot(url)]:
+                    work.append((base, url))
 
-        return work
+        return work, entries
+
+    def get_base_name(self, date_key: str, year: int, post_id: str, used: dict) -> str:
+        """The filename stem for a post, without an extension.
+
+        The first post for a date keeps the bare MM_DD so existing downloads stay
+        put. Later ones carry their year, and the post id as well on the rare
+        date that has two posts from the same year.
+        """
+        taken = used.setdefault(date_key, set())
+        if not taken:
+            base = date_key
+        else:
+            base = f"{date_key}_{year}"
+            if base in taken:
+                base = f"{date_key}_{year}_{post_id}"
+        taken.add(base)
+        return base
 
     async def download_to_organized_directories(self):
         posts = MediaPost.select().where(MediaPost.username == self.username)

@@ -139,9 +139,13 @@ inside one fetch is caught there so it cannot cancel the rest of the batch.
   re-encoded: the sources are already lossy jpeg, so converting to png cost roughly
   310ms per image and 2.6x the disk for no quality gain.
 - `MM_DD.mp4` alongside it for the handful of posts that were `.gifv`.
-- `data.json` mapping `"MM_DD"` to `{"comment": ..., "file": ..., "video": ...}`, with
-  the surrounding braces stripped off the stored comment. `file` and `video` carry
-  basenames because the extension varies, and are `null` when absent.
+- `MM_DD_YYYY.<ext>` for older posts on a date the newest post already holds, and
+  `MM_DD_YYYY_<postid>.<ext>` on the one date with two posts from the same year.
+- `data.json` mapping `"MM_DD"` to
+  `{"comment", "year", "file", "video", "others"}`, with the surrounding braces stripped
+  off the stored comment. `file` and `video` carry basenames because the extension
+  varies, and are `null` when absent. `others` holds entries of the same shape minus
+  `others`, newest first.
 
 The extension comes from `sniff_extension`, which reads magic bytes and returns None
 for anything else, so a response that is not media is refused rather than written. Urls
@@ -151,11 +155,18 @@ and `.mp4` siblings, which are both real; the mp4 runs about a seventeenth of th
 size.
 
 Keys are month and day only, so posts from the same calendar date in different years
-collide. Posts are iterated newest-first and the first post seen for a date claims it,
-so both the image and the caption come from the newest post and older duplicates are
-discarded outright. Keep that first-wins rule intact when touching this loop: an
-earlier version recorded the caption on every iteration, which left the image from the
-newest post paired with the caption from the oldest.
+collide. 132 of 365 dates are in that position here. Posts are iterated newest-first;
+the first one for a date becomes the main entry and keeps the bare `MM_DD` name, so
+nothing already on disk has to move when this logic changes.
+
+Older posts for the same date land in `others` rather than being dropped. They are
+worth keeping: of the 132 collisions, 115 are the identical url posted again, which
+`plan_downloads` discards as not being a second result at all, but the remaining 17 are
+a different screenshot, and 14 of those are a different show entirely.
+
+A caption and its image must come from the same post. An earlier version recorded the
+caption on every iteration while skipping the download, which paired the newest post's
+image with the oldest post's caption.
 
 `download_to_organized_directories` is the previous layout
 (`data/MM_Month/DD/<post_id>.png` plus a sibling `.txt` caption). It still works but
@@ -169,7 +180,7 @@ Measured against this account, 500 posts and 365 dated images:
 | | cold, nothing stored | incremental, nothing new |
 |---|---|---|
 | scrape | 13.7s | ~6s |
-| download | ~27s (126 MB) | 0.04s |
+| download | ~27s (130 MB) | 0.04s |
 | total | **41s** | **7s** |
 
 The incremental case is now dominated by walking the submissions listing, about five

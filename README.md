@@ -66,12 +66,18 @@ each date:
     {
         "01_01": {
             "comment": "Anime Source Title",
+            "year": 2024,
             "file": "01_01.jpg",
-            "video": null
+            "video": null,
+            "others": []
         }
     }
 
 `file` is null if the image could not be downloaded, and `video` is set only for the
 `.gifv` posts.
+
+The account often posts on the same calendar date in more than one year. When those are
+different images, the newest is the main entry and the rest are kept in `others`, named
+`01_01_2023.jpg` and so on. Reposts of the identical image are not duplicated.
 
 Nothing under `data/` is committed.

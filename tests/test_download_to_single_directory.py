@@ -68,11 +68,19 @@ def test_writes_one_image_and_one_entry_per_post(
     assert (bulk(tmp_path) / "01_01.jpg").exists()
     assert (bulk(tmp_path) / "12_25.jpg").exists()
     assert read_data_json(tmp_path) == {
-        "01_01": {"comment": "Cowboy Bebop", "file": "01_01.jpg", "video": None},
+        "01_01": {
+            "comment": "Cowboy Bebop",
+            "year": 2024,
+            "file": "01_01.jpg",
+            "video": None,
+            "others": [],
+        },
         "12_25": {
             "comment": "Serial Experiments Lain",
+            "year": 2024,
             "file": "12_25.jpg",
             "video": None,
+            "others": [],
         },
     }
 
@@ -112,8 +120,10 @@ def test_a_gifv_post_keeps_both_the_gif_and_the_mp4(
     assert (bulk(tmp_path) / "01_01.mp4").exists()
     assert read_data_json(tmp_path)["01_01"] == {
         "comment": "Some Anime",
+        "year": 2024,
         "file": "01_01.gif",
         "video": "01_01.mp4",
+        "others": [],
     }
 
 
@@ -140,11 +150,13 @@ def test_posts_without_a_comment_get_an_empty_string(
     assert read_data_json(tmp_path)["01_01"]["comment"] == ""
 
 
-def test_newest_post_wins_a_duplicate_date(scraper, tmp_path, downloads, make_post):
-    """Same calendar date in two years collides on the MM_DD key.
+def test_the_newest_post_leads_a_duplicate_date(
+    scraper, tmp_path, downloads, make_post
+):
+    """The newest post is the date's main entry, and its image keeps MM_DD.
 
-    The image and the caption must both come from the newer post, not one from
-    each.
+    The caption and the image must come from the same post, which an earlier
+    version got wrong by pairing the newest image with the oldest caption.
     """
     make_post("old", month=1, day=1, year=2023, comment="{Older Anime}")
     make_post("new", month=1, day=1, year=2025, comment="{Newer Anime}")
@@ -152,12 +164,76 @@ def test_newest_post_wins_a_duplicate_date(scraper, tmp_path, downloads, make_po
 
     asyncio.run(scraper.download_to_single_directory())
 
-    assert read_data_json(tmp_path)["01_01"]["comment"] == "Newer Anime"
-    assert len(downloads) == 1
+    entry = read_data_json(tmp_path)["01_01"]
+    assert entry["comment"] == "Newer Anime"
+    assert entry["file"] == "01_01.jpg"
 
     with Image.open(bulk(tmp_path) / "01_01.jpg") as img:
         red, green, blue = img.convert("RGB").getpixel((0, 0))
-    assert red > blue, "image should come from the newer post"
+    assert red > blue, "the main image should come from the newer post"
+
+
+def test_an_older_post_for_the_same_date_is_kept(
+    scraper, tmp_path, downloads, make_post
+):
+    """Across years the same date is usually a different show entirely."""
+    make_post("old", month=1, day=1, year=2023, comment="{Older Anime}")
+    make_post("new", month=1, day=1, year=2025, comment="{Newer Anime}")
+    downloads.colours.update({"old": (0, 0, 255), "new": (255, 0, 0)})
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    others = read_data_json(tmp_path)["01_01"]["others"]
+    assert others == [
+        {
+            "comment": "Older Anime",
+            "year": 2023,
+            "file": "01_01_2023.jpg",
+            "video": None,
+        }
+    ]
+
+    with Image.open(bulk(tmp_path) / "01_01_2023.jpg") as img:
+        red, green, blue = img.convert("RGB").getpixel((0, 0))
+    assert blue > red, "the kept extra should be the older post's image"
+
+
+def test_a_repost_of_the_same_url_is_not_a_second_result(
+    scraper, tmp_path, downloads, make_post
+):
+    """Most duplicate dates here are the identical image posted again."""
+    from models import MediaPost
+
+    make_post("old", month=1, day=1, year=2023, comment="{Same Anime}")
+    make_post("new", month=1, day=1, year=2025, comment="{Same Anime}")
+    shared = MediaPost.get_by_id("old").media_url
+    post = MediaPost.get_by_id("new")
+    post.media_url = shared
+    post.save()
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    assert read_data_json(tmp_path)["01_01"]["others"] == []
+    assert len(downloads) == 1
+
+
+def test_two_posts_from_the_same_year_get_distinct_names(
+    scraper, tmp_path, downloads, make_post
+):
+    make_post("aaa", month=6, day=29, year=2023, comment="{First}")
+    make_post("bbb", month=6, day=29, year=2023, comment="{Second}")
+    make_post("ccc", month=6, day=29, year=2024, comment="{Newest}")
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    entry = read_data_json(tmp_path)["06_29"]
+    assert entry["file"] == "06_29.jpg"
+    names = sorted(o["file"] for o in entry["others"])
+    assert names == ["06_29_2023.jpg", "06_29_2023_aaa.jpg"] or names == [
+        "06_29_2023.jpg",
+        "06_29_2023_bbb.jpg",
+    ]
+    assert len(set(names)) == 2
 
 
 def test_existing_image_is_not_downloaded_again(
@@ -172,7 +248,13 @@ def test_existing_image_is_not_downloaded_again(
     assert downloads == []
     # the entry still has to be written, since data.json is rebuilt from scratch
     assert read_data_json(tmp_path) == {
-        "01_01": {"comment": "Cowboy Bebop", "file": "01_01.jpg", "video": None}
+        "01_01": {
+            "comment": "Cowboy Bebop",
+            "year": 2024,
+            "file": "01_01.jpg",
+            "video": None,
+            "others": [],
+        }
     }
 
 
@@ -202,7 +284,13 @@ def test_a_failed_download_records_no_file(scraper, tmp_path, monkeypatch, make_
     asyncio.run(scraper.download_to_single_directory())
 
     assert read_data_json(tmp_path) == {
-        "01_01": {"comment": "Cowboy Bebop", "file": None, "video": None}
+        "01_01": {
+            "comment": "Cowboy Bebop",
+            "year": 2024,
+            "file": None,
+            "video": None,
+            "others": [],
+        }
     }
 
 
