@@ -266,3 +266,51 @@ def test_other_users_posts_are_ignored(scraper, tmp_path, downloads, make_post):
 
     assert read_data_json(tmp_path) == {}
     assert downloads == []
+
+
+def test_downloads_run_concurrently(scraper, tmp_path, monkeypatch, make_post):
+    """The claiming pass is ordered, but the fetches it produces are not."""
+    import scraper as scraper_module
+
+    in_flight = 0
+    peak = 0
+
+    async def slow_download(self, media_url, filename, session=None):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        open(filename, "wb").write(b"\xff\xd8\xff body")
+        return filename
+
+    monkeypatch.setattr(Scraper, "download_image", slow_download)
+    for day in range(1, 13):
+        make_post(f"post{day:02}", month=1, day=day)
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    assert peak > 1, "downloads should overlap"
+    assert peak <= scraper_module.DOWNLOAD_CONCURRENCY
+    assert len(read_data_json(tmp_path)) == 12
+
+
+def test_a_failing_download_does_not_sink_the_others(
+    scraper, tmp_path, monkeypatch, make_post
+):
+    async def flaky(self, media_url, filename, session=None):
+        if "post02" in media_url:
+            raise RuntimeError("connection reset")
+        open(filename, "wb").write(b"\xff\xd8\xff body")
+        return filename
+
+    monkeypatch.setattr(Scraper, "download_image", flaky)
+    for day in (1, 2, 3):
+        make_post(f"post{day:02}", month=1, day=day)
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    data = read_data_json(tmp_path)
+    assert data["01_01"]["file"] == "01_01.jpg"
+    assert data["01_02"]["file"] is None
+    assert data["01_03"]["file"] == "01_03.jpg"

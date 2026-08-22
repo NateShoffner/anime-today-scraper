@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 from db import database_proxy
@@ -11,9 +12,16 @@ from scraper import Scraper
 load_dotenv()
 
 # captions contain characters the default Windows console encoding cannot represent
-# (the triangle in "Yuru Camp△", for one), and an encoding failure inside a print
-# surfaces as a misleading error from whatever call it interrupts
+# (the triangle in "Yuru Camp△", for one), and an encoding failure while writing a log
+# record surfaces as a misleading error from whatever call it interrupts
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-7s %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
 
 data_dir = "data"
 if not os.path.exists(data_dir):

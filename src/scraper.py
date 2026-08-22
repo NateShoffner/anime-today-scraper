@@ -3,6 +3,7 @@ from calendar import month_name, day_name
 from contextlib import AsyncExitStack
 import datetime
 import json
+import logging
 import aiohttp
 import os
 import asyncpraw
@@ -13,6 +14,10 @@ from models import MediaPost
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+# imgur tolerates this comfortably and the images are large
+DOWNLOAD_CONCURRENCY = 8
 
 IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "gif", "webp")
 VIDEO_EXTENSIONS = ("mp4",)
@@ -112,14 +117,14 @@ class Scraper:
             with Image.open(filename) as img:
                 img.save(new_filename, "PNG")
         except Exception as e:
-            print(f"Error converting {filename} to PNG: {e}")
+            logger.warning("Error converting %s to PNG: %s", filename, e)
             # a partial png is worse than none, it would be mistaken for a
             # finished download on the next run
             if os.path.exists(new_filename):
                 try:
                     os.remove(new_filename)
                 except Exception as remove_error:
-                    print(f"Error removing {new_filename}: {remove_error}")
+                    logger.warning("Error removing %s: %s", new_filename, remove_error)
 
         # the source goes either way: on success the png has replaced it, and on
         # failure it is unusable and would otherwise make download_image skip this
@@ -127,7 +132,7 @@ class Scraper:
         try:
             os.remove(filename)
         except Exception as e:
-            print(f"Error removing {filename}: {e}")
+            logger.warning("Error removing %s: %s", filename, e)
 
     def get_processed_ids(self) -> set:
         """Every submission id already stored.
@@ -144,12 +149,30 @@ class Scraper:
             )
         }
 
+    async def get_captions(self, target_user) -> dict:
+        """Every {Anime Title} caption the account has written, by submission id.
+
+        The account replies to its own posts, so its comment listing carries the
+        same captions as the posts do, but 100 per request instead of one api
+        call plus a rate-limit sleep per post. Reddit caps the listing at 1000,
+        so get_posts still falls back to the per-post lookup for anything the
+        listing does not reach.
+        """
+        captions = {}
+        async for comment in target_user.comments.new(limit=None):
+            body = comment.body
+            if body.startswith("{") and body.endswith("}"):
+                captions.setdefault(comment.link_id.split("_", 1)[1], body)
+        logger.info("Found %d captions in the comment listing", len(captions))
+        return captions
+
     async def get_first_comment(self, submission):
         """The post's own {Anime Title} comment, or None.
 
-        Costs one extra api call per post, hence the sleep.
+        The slow path. Costs one api call plus a sleep, and is only used for
+        posts the bulk caption listing did not reach.
         """
-        print("Checking for comment...")
+        logger.debug("Checking for comment on %s", submission.id)
         # sleep to avoid rate limiting
         await asyncio.sleep(1)
         try:
@@ -160,11 +183,11 @@ class Scraper:
                     and comment.body.startswith("{")
                     and comment.body.endswith("}")
                 ):
-                    print(f"Found comment: {comment.body}")
+                    logger.info("Found comment: %s", comment.body)
                     return comment.body
         except Exception as e:
             # TODO reddit will sometimes return a 429 error when trying to get the comments, we should retry
-            print(f"Error getting comment: {e}")
+            logger.warning("Error getting comment for %s: %s", submission.id, e)
         return None
 
     async def backfill_comments(self):
@@ -182,25 +205,32 @@ class Scraper:
                 & (MediaPost.first_comment.is_null())
             )
         )
-        print(f"Backfilling comments for {len(missing)} posts")
+        logger.info("Backfilling comments for %d posts", len(missing))
 
         async with asyncpraw.Reddit(
             client_id=os.getenv("REDDIT_CLIENT_ID"),
             client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
             user_agent=self.user_agent,
         ) as reddit:
+            target_user = await reddit.redditor(self.username)
+            captions = await self.get_captions(target_user)
+
             for post in missing:
-                print(f"Checking {post.title} - {post.permalink}")
-                submission = await reddit.submission(post.id)
-                comment = await self.get_first_comment(submission)
+                comment = captions.get(post.id)
+                if comment is None:
+                    logger.info("Not in the listing, checking %s", post.permalink)
+                    comment = await self.get_first_comment(
+                        await reddit.submission(post.id)
+                    )
                 if comment:
+                    logger.info("Caption for %s: %s", post.title, comment)
                     post.first_comment = comment
                     post.save()
 
     async def get_posts(self):
         """Get all posts from the target user"""
         processed_ids = self.get_processed_ids()
-        print(f"Already processed: {len(processed_ids)} posts")
+        logger.info("Already processed: %d posts", len(processed_ids))
 
         async with asyncpraw.Reddit(
             client_id=os.getenv("REDDIT_CLIENT_ID"),
@@ -212,12 +242,20 @@ class Scraper:
             month_names = [name.lower() for name in month_name if name]
             day_names = [name.lower() for name in day_name]
 
+            # deferred: an incremental run usually finds nothing new, and the
+            # listing walk is the most expensive thing left in this phase
+            captions = None
+            added = 0
+
             async for submission in target_user.submissions.new(limit=None):
                 # TODO account for possible updates to the post title and/or first comment
 
                 if submission.id in processed_ids:
-                    print(f"Post already processed: {submission.title}")
+                    logger.debug("Post already processed: %s", submission.title)
                     continue
+
+                if captions is None:
+                    captions = await self.get_captions(target_user)
 
                 title = submission.title.lower()
 
@@ -237,13 +275,27 @@ class Scraper:
                 # and its .gifv player links while still rejecting bare links
                 # like gfycat.com/SomeSlug that carry no media at all
                 if not os.path.splitext(urlparse(submission.url).path)[1]:
-                    print(f"Skipping {submission.title} because it's not an image")
+                    logger.info("Skipping %s, it is not media", submission.title)
                     non_media_post = True
 
-                if not malformed_title and not non_media_post:
+                # the bulk listing makes a caption a dict lookup, so take one
+                # wherever it exists. a typo'd title like "Junly 1st" still has a
+                # perfectly good caption, and it used to be dropped only because
+                # the lookup cost an api call
+                submission_comment = captions.get(submission.id)
+
+                # the slow path is still worth avoiding for posts unlikely to
+                # have a caption at all
+                if (
+                    submission_comment is None
+                    and not malformed_title
+                    and not non_media_post
+                ):
                     submission_comment = await self.get_first_comment(submission)
 
                 processed_ids.add(submission.id)
+                added += 1
+                logger.info("Storing %s", submission.title)
                 MediaPost.create(
                     username=submission.author.name,
                     title=submission.title,
@@ -255,6 +307,8 @@ class Scraper:
                     malformed_title=malformed_title,
                     non_media_post=non_media_post,
                 )
+
+            logger.info("Stored %d new posts", added)
 
     async def download_to_single_directory(self):
         posts = (
@@ -273,7 +327,7 @@ class Scraper:
         posts_data = {}
 
         existing = self.index_existing_images(bulk_dir)
-        print(f"Already downloaded: {len(existing)} images")
+        logger.info("Already downloaded: %d files", len(existing))
 
         async with self.open_session() as session:
             await self.download_posts(posts, bulk_dir, posts_data, session, existing)
@@ -287,61 +341,79 @@ class Scraper:
         return "video" if extension in VIDEO_EXTENSIONS else "file"
 
     async def download_posts(self, posts, bulk_dir, posts_data, session, existing):
-        """Fill posts_data and the bulk directory, newest post per date wins."""
-        for submission in posts:
-            print(f"Processing {submission.title} - {submission.permalink}")
+        """Fill posts_data and the bulk directory, newest post per date wins.
 
+        Claiming a date is sequential, because the first post seen for a date
+        wins and that ordering has to be respected. The downloads it produces
+        are independent, so they run together.
+        """
+        work = self.plan_downloads(posts, posts_data, existing)
+        if not work:
+            logger.info("Nothing to download")
+            return
+
+        logger.info("Downloading %d files", len(work))
+        semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+        async def fetch(date_key, url):
+            async with semaphore:
+                requested = f"{date_key}{os.path.splitext(urlparse(url).path)[1]}"
+                try:
+                    return date_key, await self.download_image(
+                        url, os.path.join(bulk_dir, requested), session
+                    )
+                except Exception as e:
+                    # one bad url must not take the other downloads down with it
+                    logger.warning("Error downloading %s: %s", url, e)
+                    return date_key, None
+
+        results = await asyncio.gather(*(fetch(d, u) for d, u in work))
+
+        for date_key, downloaded in results:
+            if not downloaded:
+                continue
+            name = os.path.basename(downloaded)
+            existing.add(name)
+            slot = "video" if name.rpartition(".")[2] in VIDEO_EXTENSIONS else "file"
+            posts_data[date_key][slot] = name
+
+    def plan_downloads(self, posts, posts_data, existing) -> list:
+        """The (date, url) pairs still missing, filling posts_data as it goes."""
+        work = []
+
+        for submission in posts:
             comment = ""
             if submission.first_comment:
                 # remove '{' at the beginning and '}' at the end
                 comment = submission.first_comment[1:-1].strip()
 
             submission_date = datetime.datetime.utcfromtimestamp(submission.created_utc)
-            submission_month = submission_date.strftime("%m")
-            submission_day = submission_date.strftime("%d")
-            date_key = f"{submission_month}_{submission_day}"
+            date_key = f"{submission_date:%m_%d}"
 
             # posts are ordered newest first, so the first one seen for a given
             # date wins and older posts for that same date are discarded
             if date_key in posts_data:
-                print(f"Skipping {submission.title} because {date_key} is already taken")
+                logger.debug("Skipping %s, %s is taken", submission.title, date_key)
                 continue
 
             # a previous run may have stored this date under another extension
-            video = f"{date_key}.mp4" if f"{date_key}.mp4" in existing else None
             posts_data[date_key] = {
                 "comment": comment,
                 "file": self.find_existing_image(existing, date_key),
-                "video": video,
+                "video": f"{date_key}.mp4" if f"{date_key}.mp4" in existing else None,
             }
 
-            wanted = [
-                url
-                for url in self.get_download_urls(submission.media_url)
-                if not posts_data[date_key][self.get_slot(url)]
-            ]
-            if not wanted:
-                print(f"Skipping {submission.title} because it's already downloaded")
-                continue
+            for url in self.get_download_urls(submission.media_url):
+                if not posts_data[date_key][self.get_slot(url)]:
+                    work.append((date_key, url))
 
-            for url in wanted:
-                requested = f"{date_key}{os.path.splitext(urlparse(url).path)[1]}"
-                downloaded = await self.download_image(
-                    url, os.path.join(bulk_dir, requested), session
-                )
-                if not downloaded:
-                    continue
-
-                name = os.path.basename(downloaded)
-                existing.add(name)
-                slot = "video" if name.rpartition(".")[2] in VIDEO_EXTENSIONS else "file"
-                posts_data[date_key][slot] = name
+        return work
 
     async def download_to_organized_directories(self):
         posts = MediaPost.select().where(MediaPost.username == self.username)
 
         for submission in posts:
-            print(f"Processing {submission.title} - {submission.permalink}")
+            logger.debug("Processing %s", submission.permalink)
 
             submission_date = datetime.datetime.utcfromtimestamp(submission.created_utc)
             submission_month = submission_date.strftime("%m_%B")
@@ -385,18 +457,18 @@ class Scraper:
 
             async with session.get(media_url) as response:
                 if response.status != 200:
-                    print(f"Error downloading {media_url}: HTTP {response.status}")
+                    logger.warning("Error downloading %s: HTTP %s", media_url, response.status)
                     return None
 
                 image_data = await response.read()
 
         if not image_data:
-            print(f"Error downloading {media_url}: empty response")
+            logger.warning("Error downloading %s: empty response", media_url)
             return None
 
         extension = self.sniff_extension(image_data)
         if extension is None:
-            print(f"Error downloading {media_url}: not media we handle")
+            logger.warning("Error downloading %s: not media we handle", media_url)
             return None
 
         filename = f"{os.path.splitext(filename)[0]}.{extension}"
