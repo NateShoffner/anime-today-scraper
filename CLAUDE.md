@@ -77,8 +77,10 @@ Every submission is stored, with two boolean flags:
 - `non_media_post` when the URL does not end in jpg/jpeg/png/gif.
 
 The comment lookup costs one extra API call per post and sleeps 1s to stay under rate
-limits, so it only runs for posts that pass both checks. The render phase does **not**
-filter on these flags.
+limits, so it only runs for posts that pass both checks. The render phase filters out
+`non_media_post` rows, which is what keeps gifv, gfycat and typo'd `.jpgg` links from
+being downloaded and then failing to convert. It does not filter on `malformed_title`,
+since those posts still carry a usable image.
 
 ### Output layout
 
@@ -103,6 +105,15 @@ format.
 
 ## Known landmines
 
+- Imgur, which hosts most of this account's older posts, answers aiohttp's default user
+  agent with an empty `429`. `download_image` sends `self.user_agent` for that reason.
+  Dropping the header does not raise, it silently yields empty files.
+- A source file that never converts must not be left on disk. `download_image` returns
+  early when the source exists while the caller only checks for the png, so a leftover
+  corrupt source is never re-downloaded and never converts, on every future run.
+- `main.py` forces utf-8 on stdout. Captions contain characters cp1252 cannot encode,
+  and the resulting error inside a `print` gets attributed to whatever call it
+  interrupted.
 - `scrape.py` at the repo root is the original single-file version, superseded by
   `src/` but still tracked.
 - `data/`, `data_old*`, and `.env` are gitignored, so no scraped output is committed.
