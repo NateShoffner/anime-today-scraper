@@ -67,11 +67,19 @@ class Scraper:
             return "gif"
         return fallback
 
-    def find_existing_image(self, directory: str, name: str):
+    def index_existing_images(self, directory: str) -> set:
+        """The bulk directory listing, read once instead of stat-ing per post."""
+        return {
+            entry
+            for entry in os.listdir(directory)
+            if entry.rpartition(".")[2].lower() in IMAGE_EXTENSIONS
+        }
+
+    def find_existing_image(self, existing: set, name: str):
         """The already-downloaded image for a name, whatever extension it used."""
         for extension in IMAGE_EXTENSIONS:
-            candidate = os.path.join(directory, f"{name}.{extension}")
-            if os.path.exists(candidate):
+            candidate = f"{name}.{extension}"
+            if candidate in existing:
                 return candidate
         return None
 
@@ -107,23 +115,25 @@ class Scraper:
         except Exception as e:
             print(f"Error removing {filename}: {e}")
 
+    def get_processed_ids(self) -> set:
+        """Every submission id already stored.
+
+        The primary key is the reddit submission id, so membership is exact. The
+        previous check asked whether created_utc fell between the oldest and
+        newest stored post, which skipped anything inside that window forever, so
+        a run interrupted midway left a permanent hole.
+        """
+        return {
+            post.id
+            for post in MediaPost.select(MediaPost.id).where(
+                MediaPost.username == self.username
+            )
+        }
+
     async def get_posts(self):
         """Get all posts from the target user"""
-        most_recent_post = (
-            MediaPost.select()
-            .where(MediaPost.username == self.username)
-            .order_by(MediaPost.created_utc.desc())
-            .first()
-        )
-        oldest_post = (
-            MediaPost.select()
-            .where(MediaPost.username == self.username)
-            .order_by(MediaPost.created_utc.asc())
-            .first()
-        )
-
-        print(f"Most recent post: {most_recent_post}")
-        print(f"Oldest post: {oldest_post}")
+        processed_ids = self.get_processed_ids()
+        print(f"Already processed: {len(processed_ids)} posts")
 
         async with asyncpraw.Reddit(
             client_id=os.getenv("REDDIT_CLIENT_ID"),
@@ -138,15 +148,7 @@ class Scraper:
             async for submission in target_user.submissions.new(limit=None):
                 # TODO account for possible updates to the post title and/or first comment
 
-                already_processed = False
-
-                if most_recent_post and oldest_post:
-                    already_processed = (
-                        submission.created_utc <= most_recent_post.created_utc
-                        and submission.created_utc >= oldest_post.created_utc
-                    )
-
-                if already_processed:
+                if submission.id in processed_ids:
                     print(f"Post already processed: {submission.title}")
                     continue
 
@@ -187,6 +189,7 @@ class Scraper:
                         # TODO reddit will sometimes return a 429 error when trying to get the comments, we should retry
                         print(f"Error getting comment: {e}")
 
+                processed_ids.add(submission.id)
                 MediaPost.create(
                     username=submission.author.name,
                     title=submission.title,
@@ -215,13 +218,16 @@ class Scraper:
 
         posts_data = {}
 
+        existing = self.index_existing_images(bulk_dir)
+        print(f"Already downloaded: {len(existing)} images")
+
         async with self.open_session() as session:
-            await self.download_posts(posts, bulk_dir, posts_data, session)
+            await self.download_posts(posts, bulk_dir, posts_data, session, existing)
 
         with open(os.path.join(bulk_dir, "data.json"), "w") as f:
             f.write(json.dumps(posts_data, indent=4))
 
-    async def download_posts(self, posts, bulk_dir, posts_data, session):
+    async def download_posts(self, posts, bulk_dir, posts_data, session, existing):
         """Fill posts_data and the bulk directory, newest post per date wins."""
         for submission in posts:
             print(f"Processing {submission.title} - {submission.permalink}")
@@ -248,10 +254,10 @@ class Scraper:
             }
 
             # a previous run may have stored this date under another extension
-            existing = self.find_existing_image(bulk_dir, date_key)
-            if existing:
+            already_downloaded = self.find_existing_image(existing, date_key)
+            if already_downloaded:
                 print(f"Skipping {submission.title} because it's already downloaded")
-                posts_data[date_key]["file"] = os.path.basename(existing)
+                posts_data[date_key]["file"] = already_downloaded
                 continue
 
             requested = f"{date_key}.{self.get_extension(submission.media_url)}"
@@ -260,6 +266,7 @@ class Scraper:
             )
             if downloaded:
                 posts_data[date_key]["file"] = os.path.basename(downloaded)
+                existing.add(posts_data[date_key]["file"])
 
     async def download_to_organized_directories(self):
         posts = MediaPost.select().where(MediaPost.username == self.username)
