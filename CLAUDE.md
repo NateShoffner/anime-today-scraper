@@ -15,11 +15,17 @@ Poetry-managed, Python ^3.10.
 
 ```
 poetry install
-poetry run python src/main.py
 poetry run pytest
 poetry run pytest tests/test_urls.py::test_sniff_extension
-LOG_LEVEL=DEBUG poetry run python src/main.py
+$(poetry env info --path)/Scripts/python.exe src/main.py
+LOG_LEVEL=DEBUG $(poetry env info --path)/Scripts/python.exe src/main.py
 ```
+
+**Do not time a run through `poetry run`.** `poetry run python -c "pass"` measures 13.3s
+on this machine, against 0.1s for the venv interpreter directly. That overhead dwarfs
+the entire incremental run and has repeatedly made the scraper look slow when it was
+not: 22.5s through `poetry run`, 7s without. Use `poetry run` for pytest, where a few
+seconds do not matter, and the interpreter path for anything you are measuring.
 
 No linter or formatter is configured, and `pyproject.toml` defines no console script
 entry point.
@@ -164,10 +170,17 @@ Measured against this account, 500 posts and 365 dated images:
 |---|---|---|
 | scrape | 13.7s | ~6s |
 | download | ~27s (126 MB) | 0.04s |
-| total | **41s** | **11s** |
+| total | **41s** | **7s** |
 
 The incremental case is now dominated by walking the submissions listing, about five
 api calls. Before any of this, a cold run took roughly fifteen minutes.
+
+These are measured with the venv interpreter. Add ~13s to every figure if invoked
+through `poetry run`.
+
+The asyncpraw clients pass `check_for_updates=False`. Otherwise every run makes a pypi
+round trip and writes the result straight to stderr, producing the one console line
+with no timestamp on it.
 
 ## Maintenance
 

@@ -27,6 +27,11 @@ directory:
 
     poetry run python src/main.py
 
+`poetry run` adds around 13 seconds of its own startup on top of that. To avoid it,
+call the virtualenv's interpreter directly:
+
+    $(poetry env info --path)/Scripts/python.exe src/main.py
+
 Each run fetches whatever it has not seen before, records it in `data/media_posts.db`,
 then writes the images out to disk. Posts and images already accounted for are skipped,
 so re-running is cheap: a full first run takes about 40 seconds, and a run with nothing

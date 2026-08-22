@@ -211,6 +211,9 @@ class Scraper:
             client_id=os.getenv("REDDIT_CLIENT_ID"),
             client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
             user_agent=self.user_agent,
+            # otherwise every run makes a pypi round trip and prints its result
+            # straight to stderr, bypassing logging
+            check_for_updates=False,
         ) as reddit:
             target_user = await reddit.redditor(self.username)
             captions = await self.get_captions(target_user)
@@ -236,6 +239,9 @@ class Scraper:
             client_id=os.getenv("REDDIT_CLIENT_ID"),
             client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
             user_agent=self.user_agent,
+            # otherwise every run makes a pypi round trip and prints its result
+            # straight to stderr, bypassing logging
+            check_for_updates=False,
         ) as reddit:
             target_user = await reddit.redditor(self.username)
 
