@@ -7,13 +7,16 @@ import aiohttp
 import os
 import asyncpraw
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 from PIL import Image
 from models import MediaPost
 
 load_dotenv()
 
 
-IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "gif")
+IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "gif", "webp")
+VIDEO_EXTENSIONS = ("mp4",)
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
 
 
 def get_permalink(submission: asyncpraw.models.Submission) -> str:
@@ -35,14 +38,20 @@ class Scraper:
     async def download_media(self):
         """Download all media posts from the target user"""
         for post in MediaPost.select().where(MediaPost.username == self.username):
-            await self.download_image(post, self.data_dir)
+            await self.download_image(post.media_url, self.data_dir)
 
-    def get_extension(self, media_url: str) -> str:
-        """The extension the post's image is served with, lowercased."""
-        extension = media_url.rsplit(".", 1)[-1].lower()
-        # non-media posts are filtered out before this runs, so an unknown
-        # extension here means a url shape we have not seen
-        return extension if extension in IMAGE_EXTENSIONS else "jpg"
+    def get_download_urls(self, media_url: str) -> list:
+        """The urls to fetch for a post.
+
+        An imgur .gifv link serves an html player page rather than media, but the
+        same id serves a real .gif and a .mp4. Both are kept: the gif is the
+        image, the mp4 is the same thing at roughly a seventeenth of the size.
+        """
+        root, extension = os.path.splitext(urlparse(media_url).path)
+        if extension.lower() == ".gifv":
+            base = media_url[: -len(extension)]
+            return [f"{base}.gif", f"{base}.mp4"]
+        return [media_url]
 
     def open_session(self) -> aiohttp.ClientSession:
         """One session serves every download.
@@ -53,11 +62,12 @@ class Scraper:
         """
         return aiohttp.ClientSession(headers={"User-Agent": self.user_agent})
 
-    def sniff_extension(self, data: bytes, fallback: str) -> str:
-        """The real format of the bytes.
+    def sniff_extension(self, data: bytes):
+        """The format of the bytes, or None if it is not media we handle.
 
-        Urls lie: imgur serves png content from .jpg links, and writing those
-        bytes to a .jpg would leave a file whose extension contradicts it.
+        Urls lie in both directions: imgur serves png content from .jpg links,
+        and a .gifv link returns an html page. Deciding from the content means a
+        mislabelled url costs nothing and a non-media response is never written.
         """
         if data.startswith(b"\xff\xd8\xff"):
             return "jpg"
@@ -65,14 +75,18 @@ class Scraper:
             return "png"
         if data[:6] in (b"GIF87a", b"GIF89a"):
             return "gif"
-        return fallback
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "webp"
+        if data[4:8] == b"ftyp":
+            return "mp4"
+        return None
 
     def index_existing_images(self, directory: str) -> set:
         """The bulk directory listing, read once instead of stat-ing per post."""
         return {
             entry
             for entry in os.listdir(directory)
-            if entry.rpartition(".")[2].lower() in IMAGE_EXTENSIONS
+            if entry.rpartition(".")[2].lower() in MEDIA_EXTENSIONS
         }
 
     def find_existing_image(self, existing: set, name: str):
@@ -130,6 +144,59 @@ class Scraper:
             )
         }
 
+    async def get_first_comment(self, submission):
+        """The post's own {Anime Title} comment, or None.
+
+        Costs one extra api call per post, hence the sleep.
+        """
+        print("Checking for comment...")
+        # sleep to avoid rate limiting
+        await asyncio.sleep(1)
+        try:
+            await submission.load()
+            async for comment in submission.comments:
+                if (
+                    comment.author == self.username
+                    and comment.body.startswith("{")
+                    and comment.body.endswith("}")
+                ):
+                    print(f"Found comment: {comment.body}")
+                    return comment.body
+        except Exception as e:
+            # TODO reddit will sometimes return a 429 error when trying to get the comments, we should retry
+            print(f"Error getting comment: {e}")
+        return None
+
+    async def backfill_comments(self):
+        """Fetch captions for stored posts that never got one.
+
+        Not part of run(). A post whose caption is genuinely absent stays null,
+        so calling this on every run would re-request those forever. It exists
+        for the case where a post was stored under a classification that skipped
+        the comment lookup and later turned out to be media after all.
+        """
+        missing = list(
+            MediaPost.select().where(
+                (MediaPost.username == self.username)
+                & (MediaPost.non_media_post == False)  # noqa: E712 (peewee needs ==)
+                & (MediaPost.first_comment.is_null())
+            )
+        )
+        print(f"Backfilling comments for {len(missing)} posts")
+
+        async with asyncpraw.Reddit(
+            client_id=os.getenv("REDDIT_CLIENT_ID"),
+            client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
+            user_agent=self.user_agent,
+        ) as reddit:
+            for post in missing:
+                print(f"Checking {post.title} - {post.permalink}")
+                submission = await reddit.submission(post.id)
+                comment = await self.get_first_comment(submission)
+                if comment:
+                    post.first_comment = comment
+                    post.save()
+
     async def get_posts(self):
         """Get all posts from the target user"""
         processed_ids = self.get_processed_ids()
@@ -165,29 +232,16 @@ class Scraper:
                 ):
                     malformed_title = True
 
-                if not submission.url.endswith(("jpg", "jpeg", "png", "gif")):
+                # the url only has to look like a file, the downloaded bytes
+                # decide what it actually is. this accepts imgur's typo'd .jpgg
+                # and its .gifv player links while still rejecting bare links
+                # like gfycat.com/SomeSlug that carry no media at all
+                if not os.path.splitext(urlparse(submission.url).path)[1]:
                     print(f"Skipping {submission.title} because it's not an image")
                     non_media_post = True
 
                 if not malformed_title and not non_media_post:
-                    print("Checking for comment...")
-                    submission_comment = None
-                    # sleep to avoid rate limiting
-                    await asyncio.sleep(1)
-                    try:
-                        await submission.load()
-                        async for comment in submission.comments:
-                            if (
-                                comment.author == self.username
-                                and comment.body.startswith("{")
-                                and comment.body.endswith("}")
-                            ):
-                                submission_comment = comment.body
-                                print(f"Found comment: {submission_comment}")
-                                break
-                    except Exception as e:
-                        # TODO reddit will sometimes return a 429 error when trying to get the comments, we should retry
-                        print(f"Error getting comment: {e}")
+                    submission_comment = await self.get_first_comment(submission)
 
                 processed_ids.add(submission.id)
                 MediaPost.create(
@@ -227,6 +281,11 @@ class Scraper:
         with open(os.path.join(bulk_dir, "data.json"), "w") as f:
             f.write(json.dumps(posts_data, indent=4))
 
+    def get_slot(self, url: str) -> str:
+        """Which data.json field a url is expected to fill."""
+        extension = os.path.splitext(urlparse(url).path)[1].lstrip(".").lower()
+        return "video" if extension in VIDEO_EXTENSIONS else "file"
+
     async def download_posts(self, posts, bulk_dir, posts_data, session, existing):
         """Fill posts_data and the bulk directory, newest post per date wins."""
         for submission in posts:
@@ -248,25 +307,35 @@ class Scraper:
                 print(f"Skipping {submission.title} because {date_key} is already taken")
                 continue
 
+            # a previous run may have stored this date under another extension
+            video = f"{date_key}.mp4" if f"{date_key}.mp4" in existing else None
             posts_data[date_key] = {
                 "comment": comment,
-                "file": None,
+                "file": self.find_existing_image(existing, date_key),
+                "video": video,
             }
 
-            # a previous run may have stored this date under another extension
-            already_downloaded = self.find_existing_image(existing, date_key)
-            if already_downloaded:
+            wanted = [
+                url
+                for url in self.get_download_urls(submission.media_url)
+                if not posts_data[date_key][self.get_slot(url)]
+            ]
+            if not wanted:
                 print(f"Skipping {submission.title} because it's already downloaded")
-                posts_data[date_key]["file"] = already_downloaded
                 continue
 
-            requested = f"{date_key}.{self.get_extension(submission.media_url)}"
-            downloaded = await self.download_image(
-                submission, os.path.join(bulk_dir, requested), session
-            )
-            if downloaded:
-                posts_data[date_key]["file"] = os.path.basename(downloaded)
-                existing.add(posts_data[date_key]["file"])
+            for url in wanted:
+                requested = f"{date_key}{os.path.splitext(urlparse(url).path)[1]}"
+                downloaded = await self.download_image(
+                    url, os.path.join(bulk_dir, requested), session
+                )
+                if not downloaded:
+                    continue
+
+                name = os.path.basename(downloaded)
+                existing.add(name)
+                slot = "video" if name.rpartition(".")[2] in VIDEO_EXTENSIONS else "file"
+                posts_data[date_key][slot] = name
 
     async def download_to_organized_directories(self):
         posts = MediaPost.select().where(MediaPost.username == self.username)
@@ -289,7 +358,7 @@ class Scraper:
             extension = submission.media_url.split(".")[-1]
             image_filename = os.path.join(day_dir, submission.id)
             image_filename = f"{image_filename}.{extension}"
-            downloaded = await self.download_image(submission, image_filename)
+            downloaded = await self.download_image(submission.media_url, image_filename)
             if downloaded:
                 self.convert_to_png(downloaded)
 
@@ -299,11 +368,12 @@ class Scraper:
                 with open(comment_filename, "w", encoding="utf-8") as f:
                     f.write(submission.first_comment)
 
-    async def download_image(self, submission: MediaPost, filename: str, session=None):
-        """Download the image, returning the path written or None on failure.
+    async def download_image(self, media_url: str, filename: str, session=None):
+        """Download one url, returning the path written or None on failure.
 
         The extension of the returned path is taken from the downloaded bytes,
-        so it can differ from the one requested. Passing a session reuses its
+        so it can differ from the one requested, and content that is not media we
+        handle is refused rather than written. Passing a session reuses its
         connection pool; without one a throwaway session is opened per call.
         """
         if os.path.exists(filename):
@@ -313,22 +383,23 @@ class Scraper:
             if session is None:
                 session = await stack.enter_async_context(self.open_session())
 
-            async with session.get(submission.media_url) as response:
+            async with session.get(media_url) as response:
                 if response.status != 200:
-                    print(
-                        f"Error downloading {submission.media_url}: "
-                        f"HTTP {response.status}"
-                    )
+                    print(f"Error downloading {media_url}: HTTP {response.status}")
                     return None
 
                 image_data = await response.read()
 
         if not image_data:
-            print(f"Error downloading {submission.media_url}: empty response")
+            print(f"Error downloading {media_url}: empty response")
             return None
 
-        root, extension = os.path.splitext(filename)
-        filename = f"{root}.{self.sniff_extension(image_data, extension.lstrip('.'))}"
+        extension = self.sniff_extension(image_data)
+        if extension is None:
+            print(f"Error downloading {media_url}: not media we handle")
+            return None
+
+        filename = f"{os.path.splitext(filename)[0]}.{extension}"
 
         with open(filename, "wb") as image_file:
             image_file.write(image_data)

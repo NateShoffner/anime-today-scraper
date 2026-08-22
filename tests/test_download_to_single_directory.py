@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 
 import pytest
 from PIL import Image
@@ -28,9 +29,19 @@ def downloads(monkeypatch):
     calls = Downloads()
     colours = {}
 
-    async def fake_download_image(self, submission, filename, session=None):
+    async def fake_download_image(self, media_url, filename, session=None):
+        # mirror the real thing: the written extension comes from the content,
+        # so an extension the format does not know becomes a jpg
+        root, _, extension = filename.rpartition(".")
+        if extension.lower() not in ("jpg", "jpeg", "png", "gif", "webp", "mp4"):
+            filename = f"{root}.jpg"
+
         calls.append(filename)
-        Image.new("RGB", (4, 4), colours.get(submission.id, (0, 0, 0))).save(filename)
+        key = os.path.splitext(os.path.basename(media_url))[0]
+        if filename.endswith(".mp4"):
+            open(filename, "wb").write(b"fake mp4")
+        else:
+            Image.new("RGB", (4, 4), colours.get(key, (0, 0, 0))).save(filename)
         return filename
 
     monkeypatch.setattr(Scraper, "download_image", fake_download_image)
@@ -57,12 +68,16 @@ def test_writes_one_image_and_one_entry_per_post(
     assert (bulk(tmp_path) / "01_01.jpg").exists()
     assert (bulk(tmp_path) / "12_25.jpg").exists()
     assert read_data_json(tmp_path) == {
-        "01_01": {"comment": "Cowboy Bebop", "file": "01_01.jpg"},
-        "12_25": {"comment": "Serial Experiments Lain", "file": "12_25.jpg"},
+        "01_01": {"comment": "Cowboy Bebop", "file": "01_01.jpg", "video": None},
+        "12_25": {
+            "comment": "Serial Experiments Lain",
+            "file": "12_25.jpg",
+            "video": None,
+        },
     }
 
 
-@pytest.mark.parametrize("extension", ["jpg", "jpeg", "png", "gif"])
+@pytest.mark.parametrize("extension", ["jpg", "jpeg", "png", "gif", "webp"])
 def test_the_source_extension_is_kept(
     scraper, tmp_path, downloads, make_post, extension
 ):
@@ -75,14 +90,44 @@ def test_the_source_extension_is_kept(
     assert read_data_json(tmp_path)["01_01"]["file"] == f"01_01.{extension}"
 
 
-def test_an_unrecognised_extension_falls_back_to_jpg(
-    scraper, tmp_path, downloads, make_post
-):
+def test_a_typod_extension_still_downloads(scraper, tmp_path, downloads, make_post):
+    """Imgur serves the real jpeg from a .jpgg link, so it is not junk."""
     make_post("aaa", month=1, day=1, extension="jpgg")
 
     asyncio.run(scraper.download_to_single_directory())
 
     assert (bulk(tmp_path) / "01_01.jpg").exists()
+    assert read_data_json(tmp_path)["01_01"]["file"] == "01_01.jpg"
+
+
+def test_a_gifv_post_keeps_both_the_gif_and_the_mp4(
+    scraper, tmp_path, downloads, make_post
+):
+    """A .gifv url is an html player, but the same id serves both real files."""
+    make_post("aaa", month=1, day=1, extension="gifv")
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    assert (bulk(tmp_path) / "01_01.gif").exists()
+    assert (bulk(tmp_path) / "01_01.mp4").exists()
+    assert read_data_json(tmp_path)["01_01"] == {
+        "comment": "Some Anime",
+        "file": "01_01.gif",
+        "video": "01_01.mp4",
+    }
+
+
+def test_a_gifv_post_only_fetches_the_half_it_is_missing(
+    scraper, tmp_path, downloads, make_post
+):
+    make_post("aaa", month=1, day=1, extension="gifv")
+    bulk(tmp_path).mkdir()
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(bulk(tmp_path) / "01_01.gif")
+
+    asyncio.run(scraper.download_to_single_directory())
+
+    assert [os.path.basename(f) for f in downloads] == ["01_01.mp4"]
+    assert read_data_json(tmp_path)["01_01"]["video"] == "01_01.mp4"
 
 
 def test_posts_without_a_comment_get_an_empty_string(
@@ -127,7 +172,7 @@ def test_existing_image_is_not_downloaded_again(
     assert downloads == []
     # the entry still has to be written, since data.json is rebuilt from scratch
     assert read_data_json(tmp_path) == {
-        "01_01": {"comment": "Cowboy Bebop", "file": "01_01.jpg"}
+        "01_01": {"comment": "Cowboy Bebop", "file": "01_01.jpg", "video": None}
     }
 
 
@@ -149,7 +194,7 @@ def test_an_existing_image_under_another_extension_is_reused(
 def test_a_failed_download_records_no_file(scraper, tmp_path, monkeypatch, make_post):
     make_post("aaa", month=1, day=1, comment="{Cowboy Bebop}")
 
-    async def failed_download(self, submission, filename, session=None):
+    async def failed_download(self, media_url, filename, session=None):
         return None
 
     monkeypatch.setattr(Scraper, "download_image", failed_download)
@@ -157,14 +202,14 @@ def test_a_failed_download_records_no_file(scraper, tmp_path, monkeypatch, make_
     asyncio.run(scraper.download_to_single_directory())
 
     assert read_data_json(tmp_path) == {
-        "01_01": {"comment": "Cowboy Bebop", "file": None}
+        "01_01": {"comment": "Cowboy Bebop", "file": None, "video": None}
     }
 
 
 def test_non_media_posts_are_skipped(scraper, tmp_path, downloads, make_post):
-    """gifv, gfycat links and typo'd extensions are not downloadable images."""
+    """Bare links like gfycat.com/SomeSlug carry no media at all."""
     make_post("aaa", month=1, day=1, extension="jpg", comment="{Cowboy Bebop}")
-    junk = make_post("bbb", month=2, day=2, extension="gifv", comment="{Nope}")
+    junk = make_post("bbb", month=2, day=2, comment="{Nope}")
     junk.non_media_post = True
     junk.save()
 
