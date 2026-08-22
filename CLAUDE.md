@@ -62,11 +62,23 @@ at startup.
 
 ### Incremental scraping
 
-`get_posts` skips a submission when its `created_utc` falls *between* the oldest and
-newest rows already stored. That is a range check, not a set-membership check, so it
-picks up posts newer or older than the known window but will never backfill a gap
-inside it. A `# TODO` in the same function notes that later edits to a title or
-caption are not detected either.
+Both phases skip work they have already done, and both track it exactly rather than by
+proxy:
+
+- `get_processed_ids` loads every stored submission id in one query. `MediaPost.id` is
+  the reddit id, so membership is exact and costs nothing per post. Newly created rows
+  are added to the set as they go, which also means a duplicate in the listing cannot
+  raise an integrity error mid-run.
+- `index_existing_images` reads the bulk directory once into a set, and
+  `find_existing_image` looks up each date against it in `IMAGE_EXTENSIONS` order.
+
+An interrupted run therefore resumes cleanly. This replaced a check asking whether
+`created_utc` fell between the oldest and newest stored rows, which treated everything
+inside that window as done and so could never backfill a hole left by a run that died
+partway. A full incremental render of 492 posts measures 0.04s with no network calls.
+
+A `# TODO` in `get_posts` notes that later edits to a title or caption are still not
+detected: tracking is by id, so an edited post stays skipped.
 
 ### Post classification
 
@@ -118,8 +130,9 @@ format.
   247ms against 69ms measured over 12 real posts. `download_image` takes an optional
   session so the render pass can hold one open for the whole run.
 - The "already downloaded" check must look for every extension, not one.
-  `find_existing_image` does that, which is also what stops images fetched before this
-  stopped forcing png from being downloaded a second time.
+  `find_existing_image` takes the set from `index_existing_images` and does that, which
+  is also what stops images fetched before this stopped forcing png from being
+  downloaded a second time.
 - `main.py` forces utf-8 on stdout. Captions contain characters cp1252 cannot encode,
   and the resulting error inside a `print` gets attributed to whatever call it
   interrupted.
