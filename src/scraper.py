@@ -44,21 +44,26 @@ class Scraper:
 
         new_filename = self.get_png_filename(filename)
 
-        converted = False
         try:
             with Image.open(filename) as img:
                 img.save(new_filename, "PNG")
-
-            converted = True
         except Exception as e:
             print(f"Error converting {filename} to PNG: {e}")
-            return
+            # a partial png is worse than none, it would be mistaken for a
+            # finished download on the next run
+            if os.path.exists(new_filename):
+                try:
+                    os.remove(new_filename)
+                except Exception as remove_error:
+                    print(f"Error removing {new_filename}: {remove_error}")
 
-        if converted:
-            try:
-                os.remove(filename)
-            except Exception as e:
-                print(f"Error removing {filename}: {e}")
+        # the source goes either way: on success the png has replaced it, and on
+        # failure it is unusable and would otherwise make download_image skip this
+        # post on every future run
+        try:
+            os.remove(filename)
+        except Exception as e:
+            print(f"Error removing {filename}: {e}")
 
     async def get_posts(self):
         """Get all posts from the target user"""
@@ -153,8 +158,13 @@ class Scraper:
                 )
 
     async def download_to_single_directory(self):
-        posts = MediaPost.select().where(MediaPost.username == self.username).order_by(
-            MediaPost.created_utc.desc()
+        posts = (
+            MediaPost.select()
+            .where(
+                (MediaPost.username == self.username)
+                & (MediaPost.non_media_post == False)  # noqa: E712 (peewee needs ==)
+            )
+            .order_by(MediaPost.created_utc.desc())
         )
 
         bulk_dir = os.path.join(self.data_dir, "bulk")
@@ -169,7 +179,7 @@ class Scraper:
             comment = ""
             if submission.first_comment:
                 # remove '{' at the beginning and '}' at the end
-                comment = submission.first_comment[1:-1]
+                comment = submission.first_comment[1:-1].strip()
 
             submission_date = datetime.datetime.utcfromtimestamp(submission.created_utc)
             submission_month = submission_date.strftime("%m")
@@ -197,8 +207,8 @@ class Scraper:
                 print(f"Skipping {submission.title} because it's already downloaded")
                 continue
 
-            await self.download_image(submission, image_filename)
-            self.convert_to_png(image_filename)
+            if await self.download_image(submission, image_filename):
+                self.convert_to_png(image_filename)
 
         with open(os.path.join(bulk_dir, "data.json"), "w") as f:
             f.write(json.dumps(posts_data, indent=4))
@@ -233,13 +243,33 @@ class Scraper:
                 with open(comment_filename, "w", encoding="utf-8") as f:
                     f.write(submission.first_comment)
 
-    async def download_image(self, submission: MediaPost, filename: str):
-        """Download the image to the given directory"""
-        if os.path.exists(filename):
-            return
+    async def download_image(self, submission: MediaPost, filename: str) -> bool:
+        """Download the image to the given directory.
 
-        async with aiohttp.ClientSession() as session:
+        Returns True when the file is on disk and worth converting.
+        """
+        if os.path.exists(filename):
+            return True
+
+        # imgur answers the default aiohttp user agent with an empty 429
+        headers = {"User-Agent": self.user_agent}
+
+        async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(submission.media_url) as response:
+                if response.status != 200:
+                    print(
+                        f"Error downloading {submission.media_url}: "
+                        f"HTTP {response.status}"
+                    )
+                    return False
+
                 image_data = await response.read()
-                with open(filename, "wb") as image_file:
-                    image_file.write(image_data)
+
+        if not image_data:
+            print(f"Error downloading {submission.media_url}: empty response")
+            return False
+
+        with open(filename, "wb") as image_file:
+            image_file.write(image_data)
+
+        return True
