@@ -17,7 +17,8 @@ Poetry-managed, Python ^3.10.
 poetry install
 poetry run python src/main.py
 poetry run pytest
-poetry run pytest tests/test_convert_to_png.py::test_get_png_filename_handles_any_extension
+poetry run pytest tests/test_urls.py::test_sniff_extension
+LOG_LEVEL=DEBUG poetry run python src/main.py
 ```
 
 No linter or formatter is configured, and `pyproject.toml` defines no console script
@@ -29,9 +30,13 @@ never touch the network or the real database: `tests/conftest.py` binds the mode
 to a fresh in-memory SQLite database per test, and the `downloads` fixture in
 `tests/test_download_to_single_directory.py` monkeypatches `Scraper.download_image` to
 write a solid-colour image instead of fetching one. Giving each post its own colour is
-how a test checks *which* post's image landed on disk. `Scraper.get_posts` has no
-coverage, since its scrape, classify, and persist steps are one asyncpraw-driven loop
-that cannot be exercised without a Reddit fixture.
+how a test checks *which* post's image landed on disk. `tests/test_get_posts.py` fakes
+the asyncpraw listings, so classification, caption assignment and the deferred caption
+fetch are all covered without a network call.
+
+Logging goes through the standard library. `main.py` calls `basicConfig` and honours
+`LOG_LEVEL`; per-post chatter is at DEBUG and everything else at INFO, so a normal run
+prints a handful of lines rather than one per post.
 
 Credentials come from a `.env` at the repo root (see `.env.default`):
 `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET`. It is a read-only script-type Reddit
@@ -59,6 +64,21 @@ a full re-scrape.
 `src/db.py` uses a peewee `DatabaseProxy` so `models.py` can declare `MediaPost`
 without importing a concrete database, and `main.py` binds the real `SqliteDatabase`
 at startup.
+
+### Fetching captions in bulk
+
+`get_captions` reads the account's own comment listing, 100 per request, and keys the
+braced captions by `link_id`. That covers 499 of 500 posts here. The alternative, and
+what this replaced, is `submission.load()` plus a comment walk per post, one api call
+each with a 1s sleep to stay under Reddit's 100/minute limit. A cold scrape went from
+roughly ten minutes to 13.7s.
+
+`get_first_comment` is the remaining slow path, for posts the listing does not reach:
+Reddit caps that listing at 1000 comments, which currently reaches back to 2021-11.
+
+The listing walk is deferred until the first unprocessed submission appears, because an
+incremental run normally finds nothing new and would otherwise pay 5s for a caption map
+it never reads.
 
 ### Incremental scraping
 
@@ -92,16 +112,20 @@ Every submission is stored, with two boolean flags:
   rejected before any request. Tightening this to a fixed extension list is what
   previously threw away imgur's typo'd `.jpgg` links, which serve ordinary jpegs.
 
-The comment lookup costs one extra API call per post and sleeps 1s to stay under rate
-limits, so it only runs for posts that pass both checks. That is why widening
-`non_media_post` leaves the newly included posts with no caption until
-`backfill_comments` runs.
+Captions are taken from the bulk listing for every post regardless of flags, since a
+dict lookup is free. Only the slow per-post fallback is still gated, and only for posts
+unlikely to have a caption at all.
 
 The render phase filters out `non_media_post` rows and nothing else. It does not filter
 on `malformed_title`, since a typo'd title like "Junly 1st" still carries a real image
 and a real caption.
 
 ### Output layout
+
+Downloads run concurrently under a `DOWNLOAD_CONCURRENCY` semaphore. `plan_downloads`
+does the claiming sequentially first, because the newest-post-per-date rule depends on
+iteration order, and returns a flat work list whose fetches are independent. A failure
+inside one fetch is caught there so it cannot cancel the rest of the batch.
 
 `download_to_single_directory` writes a flat `data/bulk/`:
 
@@ -132,6 +156,19 @@ newest post paired with the caption from the oldest.
 is no longer called by `run()`. The `data/` tree checked out locally is in this older
 format.
 
+## Timings
+
+Measured against this account, 500 posts and 365 dated images:
+
+| | cold, nothing stored | incremental, nothing new |
+|---|---|---|
+| scrape | 13.7s | ~6s |
+| download | ~27s (126 MB) | 0.04s |
+| total | **41s** | **11s** |
+
+The incremental case is now dominated by walking the submissions listing, about five
+api calls. Before any of this, a cold run took roughly fifteen minutes.
+
 ## Maintenance
 
 `backfill_comments` fetches captions for stored posts that have none, and is
@@ -140,7 +177,8 @@ null, so running it every time would re-request those forever. It exists for the
 where a post was stored under a classification that skipped the comment lookup and
 later turned out to be media. Widening the `non_media_post` rule is exactly that case,
 and needs the stored flag recomputed for existing rows, since id tracking means those
-posts are never scraped again.
+posts are never scraped again. It uses the same bulk caption listing as `get_posts` and
+only falls back to the per-post lookup for what the listing misses.
 
 ## Known landmines
 

@@ -27,10 +27,12 @@ directory:
 
     poetry run python src/main.py
 
-Each run fetches posts newer or older than what has already been seen, records them in
-`data/media_posts.db`, then writes the images out to disk. Images that are already
-downloaded are left alone, so re-running is cheap. Delete the database to force a full
-re-scrape.
+Each run fetches whatever it has not seen before, records it in `data/media_posts.db`,
+then writes the images out to disk. Posts and images already accounted for are skipped,
+so re-running is cheap: a full first run takes about 40 seconds, and a run with nothing
+new about 10. Delete the database to force a full re-scrape.
+
+Set `LOG_LEVEL=DEBUG` for per-post output.
 
 Tests
 -----
