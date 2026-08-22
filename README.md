@@ -46,18 +46,21 @@ Output
     data/
       media_posts.db
       bulk/
-        01_01.png
+        01_01.jpg
         01_02.png
         ...
         data.json
 
-Images are named by month and day and converted to PNG. `data.json` holds the caption
-for each date:
+Images are named by month and day and kept in whatever format the post used, so the
+extension varies. `data.json` holds the caption and the filename for each date:
 
     {
         "01_01": {
-            "comment": "Anime Source Title"
+            "comment": "Anime Source Title",
+            "file": "01_01.jpg"
         }
     }
+
+`file` is null if the image could not be downloaded.
 
 Nothing under `data/` is committed.

@@ -86,10 +86,16 @@ since those posts still carry a usable image.
 
 `download_to_single_directory` writes a flat `data/bulk/`:
 
-- `MM_DD.png` per image, converted from the downloaded original via Pillow. The source
-  file is deleted after a successful convert.
-- `data.json` mapping `"MM_DD"` to `{"comment": ...}`, with the surrounding braces
-  stripped off the stored comment.
+- `MM_DD.<ext>` per image, stored in whatever format the post used. Nothing is
+  re-encoded: the sources are already lossy jpeg, so converting to png cost roughly
+  310ms per image and 2.6x the disk for no quality gain.
+- `data.json` mapping `"MM_DD"` to `{"comment": ..., "file": ...}`, with the surrounding
+  braces stripped off the stored comment. `file` carries the basename because the
+  extension now varies, and is `null` when the download failed.
+
+The extension comes from `sniff_extension`, which reads the magic bytes rather than
+trusting the url. Imgur serves png content from `.jpg` links, and at least one post in
+this account's history does exactly that.
 
 Keys are month and day only, so posts from the same calendar date in different years
 collide. Posts are iterated newest-first and the first post seen for a date claims it,
@@ -108,9 +114,12 @@ format.
 - Imgur, which hosts most of this account's older posts, answers aiohttp's default user
   agent with an empty `429`. `download_image` sends `self.user_agent` for that reason.
   Dropping the header does not raise, it silently yields empty files.
-- A source file that never converts must not be left on disk. `download_image` returns
-  early when the source exists while the caller only checks for the png, so a leftover
-  corrupt source is never re-downloaded and never converts, on every future run.
+- `open_session` exists because a session per image pays a fresh tcp and tls handshake:
+  247ms against 69ms measured over 12 real posts. `download_image` takes an optional
+  session so the render pass can hold one open for the whole run.
+- The "already downloaded" check must look for every extension, not one.
+  `find_existing_image` does that, which is also what stops images fetched before this
+  stopped forcing png from being downloaded a second time.
 - `main.py` forces utf-8 on stdout. Captions contain characters cp1252 cannot encode,
   and the resulting error inside a `print` gets attributed to whatever call it
   interrupted.
